@@ -1,121 +1,105 @@
 # Sakimi-Next
 
-A minimal Rust implementation of Qwen3-Next architecture with ~10M parameters.
+Minimal Rust implementation of a Qwen3-Next-style tiny model.
 
-## Overview
+## Current Target (Active)
 
-Sakimi-Next is a compact implementation of the [Qwen3-Next](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd) architecture, featuring:
+This repository is currently aligned to **one main training target**:
 
-- **Hybrid 3:1 DeltaNet:Attention layers** - Core innovation from Qwen3-Next
-- **Gated DeltaNet (official-style recurrence)** - `beta/g/A_log/dt_bias` path with short convolution
-- **Fast kernel path (Rust/Candle)** - grouped `conv1d` + vectorized recurrent updates
-- **Gated Attention** - official `q_proj -> (query, gate)` path
-- **Qwen3-Next/Gemma3-style RMSNorm** - `norm(x) * (1 + weight)` for decoder norms
-- **RoPE (25%)** - Rotary Position Embedding on first 25% of dimensions only
-- **SwiGLU FFN** - Modern activation function
-- **GQA** - Grouped Query Attention for efficiency
+- Config: `tiny_10m`
+- Parameters: ~10.5M
+- Vocab size: 8192
+- Layers: 8 (6 DeltaNet + 2 Attention, 3:1 pattern)
+- Hidden size: 256
+- Heads: 4 (KV heads: 1)
+- FFN size: 768
+- RoPE partial rotary factor: 0.25
+- Fast kernels: enabled by default
 
-## Architecture
+## Implemented Components
 
-```
-Input → Embedding → [HybridLayer × n_layers] → FinalNorm → LMHead → Output
+- Hybrid 3:1 DeltaNet:Attention stack
+- Gated DeltaNet recurrent path (`A_log/dt_bias` + short convolution)
+- Gated Attention path (`q_proj -> query + gate`)
+- Qwen3-Next/Gemma3-style decoder RMSNorm (`norm(x) * (1 + weight)`)
+- Q/K RMSNorm and RoPE on partial head dimensions
+- SwiGLU FFN
+- GQA-style KV sharing
+- Training / resume / checkpoint save
+- Local generation from checkpoint
 
-Each HybridLayer:
-  x = x + DeltaNetOrAttention(Norm1(x))
-  x = x + FFN(Norm2(x))
-
-Layer ratio (3:1):
-  - 3 × Gated DeltaNet layers
-  - 1 × Gated Attention layer
-```
-
-## Configuration Presets
-
-| Config | Parameters | vocab | layers | d_model | heads | Description |
-|--------|------------|-------|--------|---------|-------|-------------|
-| `tiny_10m` | ~10M | 4K | 8 | 256 | 4/1 | Recommended |
-| `tiny_5m` | ~5M | 2K | 4 | 128 | 4/1 | Ultra-small |
-| `small_50m` | ~50M | 50K | 12 | 512 | 8/2 | Small model |
-
-## Installation
+## Build
 
 ```bash
-# Clone the repository
 git clone https://github.com/SakuyaInazaki/sakimi-next.git
 cd sakimi-next
-
-# Build
 cargo build --release
 ```
 
-## Usage
+## Basic Workflow
+
+### 1) Prepare tokenizer + tokenized data
 
 ```bash
-# Run test forward pass
-cargo run --release -- --config tiny_10m --mode test
-
-# Prepare training data
-cargo run --release -- --config tiny_10m --mode prepare_data --train-data path/to/train.txt
-
-# Train
-cargo run --release -- --config tiny_10m --mode train --steps 10000 --learning-rate 1e-4
-
-# Generate (TODO)
-cargo run --release -- --config tiny_10m --mode generate
+cargo run --release -- \
+  --config tiny_10m \
+  --mode prepare_data \
+  --train-data data/train.txt \
+  --tokenizer data/tokenizer.json
 ```
 
-## Tencent Cloud GPU
-
-If you want to train on Tencent Cloud GPU CVM, use:
+### 2) Train
 
 ```bash
-bash scripts/train_tencent_gpu.sh
+cargo run --release -- \
+  --config tiny_10m \
+  --mode train \
+  --steps 30000 \
+  --batch-size 8 \
+  --seq-len 128 \
+  --save-every 250 \
+  --train-data data/train.txt \
+  --tokenizer data/tokenizer.json
 ```
 
-Quickstart details:
+### 3) Resume training
 
-- `docs/tencent-cloud-quickstart.md`
-- `scripts/train_nvidia_gpu.sh` (common NVIDIA cloud training entry)
-- `scripts/switch_candle_backend.sh` (switch `cuda` / `metal` / `cpu`)
+```bash
+cargo run --release -- \
+  --config tiny_10m \
+  --mode train \
+  --resume-from checkpoints/step_020500.safetensors \
+  --steps 30000 \
+  --batch-size 8 \
+  --seq-len 128 \
+  --save-every 250 \
+  --train-data data/train.txt \
+  --tokenizer data/tokenizer.json
+```
 
-## Implementation Details
+### 4) Generate with trained checkpoint
 
-### Gated DeltaNet
+```bash
+cargo run --release -- \
+  --config tiny_10m \
+  --mode generate \
+  --tokenizer data/tokenizer.json \
+  --resume-from checkpoints/step_020500.safetensors \
+  --prompt "介绍一下哈基米" \
+  --max-new-tokens 120
+```
 
-Implements the core Qwen3-Next gated-delta path in a small-model setting:
+## Notes
 
-- Joint `q/k/v/z` projection + `b/a` projection
-- ShortConvolution on concatenated QKV (kernel_size=4)
-- `g = -exp(A_log) * softplus(a + dt_bias)` discretization path
-- Recurrent gated-delta update used in the official implementation
-- RMSNormGated (`RMSNorm(x) * silu(z)`) before output projection
-
-### Stability Features
-
-From Qwen3-Next paper:
-
-- **Qwen3-Next/Gemma3-style RMSNorm** for decoder norms
-- **Q/K RMSNorm + gated attention output path**
-- **25% RoPE** for attention heads
-
-### Scope
-
-This repository targets compact models and does not yet include:
-
-- MoE routing/expert layers from the full Qwen3-Next release
-- External CUDA kernel stack (`flash-linear-attention`, `causal-conv1d`) from the official ecosystem
-- Full MTP training/inference pipeline
+- This project focuses on compact dense models (no MoE routing).
+- Official external CUDA kernel stack is not required for basic training/inference here.
 
 ## References
 
 - [Qwen3-Next Blog](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd)
-- [Gated Delta Networks (NVlabs)](https://github.com/NVlabs/GatedDeltaNet)
-- [Gemma Team (Zero-Centered RMSNorm)](https://github.com/google/gemma_pytorch)
+- [Gated Delta Networks](https://github.com/NVlabs/GatedDeltaNet)
+- [Gemma (RMSNorm variant)](https://github.com/google/gemma_pytorch)
 
 ## License
 
 MIT
-
-## Author
-
-SakuyaInazaki
