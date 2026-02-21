@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn test_training_step_updates_model_weights() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = Config::tiny_5m();
+        let cfg = Config::tiny_10m();
         let vb = VarBuilder::zeros(DType::F32, &device);
         let model = MiniQwenNext::new(&vb, &device, cfg.clone())?;
 
@@ -471,7 +471,7 @@ mod tests {
     fn panic_model() -> MiniQwenNext {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
-        MiniQwenNext::new(&vb, &device, Config::tiny_5m()).unwrap()
+        MiniQwenNext::new(&vb, &device, Config::tiny_10m()).unwrap()
     }
 
     fn panic_optimizer() -> AdamW {

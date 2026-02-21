@@ -8,7 +8,7 @@ set -euo pipefail
 #   bash scripts/train_nvidia_gpu.sh
 #
 # Optional environment overrides:
-#   CONFIG=tiny_5m
+#   CONFIG=tiny_10m
 #   STEPS=20000
 #   BATCH_SIZE=16
 #   SEQ_LEN=512
@@ -18,7 +18,7 @@ set -euo pipefail
 #   SAVE_EVERY=1000
 #   DISABLE_FAST_KERNELS=0
 
-CONFIG="${CONFIG:-tiny_5m}"
+CONFIG="${CONFIG:-tiny_10m}"
 STEPS="${STEPS:-20000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 SEQ_LEN="${SEQ_LEN:-512}"

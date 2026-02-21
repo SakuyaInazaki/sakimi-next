@@ -36,7 +36,7 @@ use training::{cross_entropy_loss, Trainer, TrainingConfig};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Configuration preset (tiny_10m, tiny_5m, small_50m). Training is locked to tiny_10m.
+    /// Configuration preset. Only `tiny_10m` is supported.
     #[arg(short, long, default_value = "tiny_10m")]
     config: String,
 
@@ -334,13 +334,15 @@ fn main() -> Result<()> {
         return run_prepare_data(&args);
     }
 
+    if args.config != TRAIN_TARGET_CONFIG {
+        return Err(candle_core::Error::Msg(format!(
+            "Only '{}' is supported, got '{}'",
+            TRAIN_TARGET_CONFIG, args.config
+        )));
+    }
+
     // Load configuration
-    let mut cfg = match args.config.as_str() {
-        "tiny_10m" => Config::tiny_10m(),
-        "tiny_5m" => Config::tiny_5m(),
-        "small_50m" => Config::small_50m(),
-        _ => panic!("Unknown config preset: {}", args.config),
-    };
+    let mut cfg = Config::tiny_10m();
     if args.disable_fast_kernels {
         cfg.use_fast_kernels = false;
     }
@@ -414,6 +416,13 @@ fn main() -> Result<()> {
 
 /// Prepare training data: build tokenizer and tokenize
 fn run_prepare_data(args: &Args) -> Result<()> {
+    if args.config != TRAIN_TARGET_CONFIG {
+        return Err(candle_core::Error::Msg(format!(
+            "Only '{}' is supported, got '{}'",
+            TRAIN_TARGET_CONFIG, args.config
+        )));
+    }
+
     println!("📚 Preparing training data...");
     println!("   Input: {}", args.train_data);
     println!("   Output directory: data/");
@@ -430,12 +439,7 @@ fn run_prepare_data(args: &Args) -> Result<()> {
 
     // Prepare data (build tokenizer, tokenize, save to binary)
     let output_dir = PathBuf::from("data");
-    let vocab_size = match args.config.as_str() {
-        "tiny_10m" => 4096,
-        "tiny_5m" => 8192,
-        "small_50m" => 50257,
-        _ => 4096,
-    };
+    let vocab_size = Config::tiny_10m().vocab_size;
 
     let _tokenizer = prepare_training_data(&train_path, &output_dir, vocab_size, args.seq_len)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare data: {}", e)))?;

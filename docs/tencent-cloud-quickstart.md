@@ -5,7 +5,7 @@ This project can be trained directly on Tencent Cloud GPU CVM.
 ## 1) Create a GPU CVM
 
 - OS: Ubuntu 22.04 (recommended)
-- GPU: NVIDIA (single card is enough for `tiny_5m` / `tiny_10m`)
+- GPU: NVIDIA (single card is enough for `tiny_10m`)
 - Ensure NVIDIA driver and CUDA runtime are ready (`nvidia-smi` works)
 
 ## 2) Clone project

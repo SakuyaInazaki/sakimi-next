@@ -108,8 +108,7 @@ Local revision for `transformers` during this audit:
 
 ### 8) Numerical/performance notes
 
-- Current `tiny_5m` preset prints ~1.5M params with new counting logic.
-- Preset names (`tiny_5m`, `tiny_10m`) no longer match actual counted params after recent structural alignment and should be re-labeled.
+- Active preset is now unified to `tiny_10m` only to avoid misconfiguration during training.
 - Cache correctness sanity-check:
   - new unit test validates `forward_with_cache` token-by-token outputs match full `forward`
   - `src/model.rs` test `test_forward_with_cache_matches_full_forward`
@@ -119,7 +118,6 @@ Local revision for `transformers` during this audit:
 - `cargo fmt`: pass
 - `cargo check`: pass
 - `cargo test`: 9 passed
-- `cargo run -- --config tiny_5m --mode test --batch-size 1 --seq-len 8`: pass
-- `cargo run -- --config tiny_5m --mode train --steps 2 --batch-size 2 --seq-len 16 --train-data data/train.txt`: pass
-- `cargo run -- --config tiny_5m --mode train --steps 1 --batch-size 2 --seq-len 16 --train-data data/train.txt`: pass
-- `cargo run -- --config tiny_5m --disable-fast-kernels --mode train --steps 1 --batch-size 2 --seq-len 16 --train-data data/train.txt`: pass
+- `cargo run -- --config tiny_10m --mode test --batch-size 1 --seq-len 8`: pass
+- `cargo run -- --config tiny_10m --mode train --steps 2 --batch-size 2 --seq-len 16 --train-data data/train.txt`: pass
+- `cargo run -- --config tiny_10m --disable-fast-kernels --mode train --steps 1 --batch-size 2 --seq-len 16 --train-data data/train.txt`: pass

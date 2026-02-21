@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn test_forward_with_cache_matches_full_forward() -> Result<()> {
         let device = Device::Cpu;
-        let cfg = Config::tiny_5m();
+        let cfg = Config::tiny_10m();
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = MiniQwenNext::new(&vb, &device, cfg)?;
 

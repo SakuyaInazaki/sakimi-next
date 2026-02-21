@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn test_recurrent_fast_matches_reference() -> Result<()> {
         let device = Device::Cpu;
-        let mut cfg = Config::tiny_5m();
+        let mut cfg = Config::tiny_10m();
         cfg.use_fast_kernels = true;
         let net = GatedDeltaNet::new(&cfg, &device)?;
 
