@@ -1,6 +1,7 @@
-use candle_core::{Result, Tensor, Device, DType};
-use candle_nn::ops;
+use candle_core::{DType, Device, Result, Tensor};
 
+use crate::activation::apply_hidden_act;
+use crate::trainable::make_trainable;
 use crate::Config;
 
 /// SwiGLU Feed-Forward Network (FFN) layer
@@ -23,9 +24,7 @@ pub struct FFN {
     pub w_gate: Tensor,
     pub w_up: Tensor,
     pub w_down: Tensor,
-    d_model: usize,
-    intermediate_size: usize,
-    device: Device,
+    hidden_act: String,
 }
 
 impl FFN {
@@ -33,28 +32,29 @@ impl FFN {
         let d_model = cfg.d_model;
         let intermediate_size = cfg.intermediate_size;
 
-        // SwiGLU uses similar initialization to GELU
-        let std = (2.0 / d_model as f64).sqrt();
+        // Match official initialization behavior via config.initializer_range.
+        let std = cfg.initializer_range;
 
         // w_gate: (d_model, intermediate_size)
-        let w_gate = Tensor::randn(0.0, std, (d_model, intermediate_size), device)?
+        let w_gate = Tensor::randn(0f32, std as f32, (d_model, intermediate_size), device)?
             .to_dtype(DType::F32)?;
+        let w_gate = make_trainable(w_gate)?;
 
         // w_up: (d_model, intermediate_size)
-        let w_up = Tensor::randn(0.0, std, (d_model, intermediate_size), device)?
+        let w_up = Tensor::randn(0f32, std as f32, (d_model, intermediate_size), device)?
             .to_dtype(DType::F32)?;
+        let w_up = make_trainable(w_up)?;
 
         // w_down: (intermediate_size, d_model)
-        let w_down = Tensor::randn(0.0, std, (intermediate_size, d_model), device)?
+        let w_down = Tensor::randn(0f32, std as f32, (intermediate_size, d_model), device)?
             .to_dtype(DType::F32)?;
+        let w_down = make_trainable(w_down)?;
 
         Ok(Self {
             w_gate,
             w_up,
             w_down,
-            d_model,
-            intermediate_size,
-            device: device.clone(),
+            hidden_act: cfg.hidden_act.clone(),
         })
     }
 
@@ -80,11 +80,9 @@ impl FFN {
         // Compute up projection: (B*L, I)
         let up = x_2d.matmul(&self.w_up)?;
 
-        // Apply SwiGLU: swish(gate) * up
-        // swish(x) = x * sigmoid(x)
-        let gate_sigmoid = ops::sigmoid(&gate)?;
-        let gate_swish = gate.broadcast_mul(&gate_sigmoid)?;
-        let hidden = gate_swish.broadcast_mul(&up)?;
+        // Apply official MLP form: act(gate) * up.
+        let gate_act = apply_hidden_act(&gate, &self.hidden_act)?;
+        let hidden = gate_act.broadcast_mul(&up)?;
 
         // Down projection: (B*L, I) @ (I, D) -> (B*L, D)
         let output = hidden.matmul(&self.w_down)?;

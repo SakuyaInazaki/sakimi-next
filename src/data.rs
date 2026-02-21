@@ -1,8 +1,9 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write, Read};
-use std::path::Path;
-use candle_core::{Result, Tensor, Device};
 use crate::tokenizer::SimpleTokenizer;
+use candle_core::{Device, Result, Tensor};
+use rand::Rng;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 /// Text dataset for language modeling
 ///
@@ -37,7 +38,8 @@ impl TextDataset {
         println!("📖 Tokenizing dataset: {:?}", path);
 
         for line in reader.lines() {
-            let line = line.map_err(|e| candle_core::Error::Msg(format!("Failed to read line: {}", e)))?;
+            let line =
+                line.map_err(|e| candle_core::Error::Msg(format!("Failed to read line: {}", e)))?;
 
             if line.trim().is_empty() {
                 continue;
@@ -104,16 +106,19 @@ impl TextDataset {
 
         // Write token count
         let token_count = self.tokens.len() as u64;
-        writer.write_all(&token_count.to_le_bytes())
+        writer
+            .write_all(&token_count.to_le_bytes())
             .map_err(|e| candle_core::Error::Msg(format!("Failed to write token count: {}", e)))?;
 
         // Write tokens
         for &token in &self.tokens {
-            writer.write_all(&token.to_le_bytes())
+            writer
+                .write_all(&token.to_le_bytes())
                 .map_err(|e| candle_core::Error::Msg(format!("Failed to write token: {}", e)))?;
         }
 
-        writer.flush()
+        writer
+            .flush()
             .map_err(|e| candle_core::Error::Msg(format!("Failed to flush: {}", e)))?;
 
         println!("💾 Saved {} tokens to {:?}", self.tokens.len(), path);
@@ -150,7 +155,8 @@ impl TextDataset {
                 // Not enough tokens for this sequence, wrap around
                 let wrap_start = 0;
                 input_data.extend_from_slice(&self.tokens[wrap_start..wrap_start + self.seq_len]);
-                target_data.extend_from_slice(&self.tokens[wrap_start + 1..wrap_start + self.seq_len + 1]);
+                target_data
+                    .extend_from_slice(&self.tokens[wrap_start + 1..wrap_start + self.seq_len + 1]);
             } else {
                 // Input: tokens[start..start+seq_len]
                 input_data.extend_from_slice(&self.tokens[start..start + self.seq_len]);
@@ -172,37 +178,33 @@ impl TextDataset {
 
     /// Get random batch
     pub fn get_random_batch(&self, batch_size: usize) -> Result<(Tensor, Tensor)> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let num_seqs = self.len();
         if num_seqs == 0 {
             return Err(candle_core::Error::Msg("Dataset is empty".to_string()));
         }
 
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap().as_nanos() as u64;
-
-        let mut indices: Vec<usize> = (0..num_seqs.min(10000)).collect();
-        // Simple shuffle using seed
-        for i in (1..indices.len()).rev() {
-            let j = (seed % (i as u64 + 1)) as usize;
-            indices.swap(i, j);
-        }
-
-        let batch_indices: Vec<usize> = indices.into_iter()
-            .take(batch_size)
+        // Fast random sampling without shuffling the entire dataset each step.
+        let mut rng = rand::thread_rng();
+        let batch_indices: Vec<usize> = (0..batch_size)
+            .map(|_| rng.gen_range(0..num_seqs))
             .collect();
 
         self.get_batch(&batch_indices)
     }
 
     /// Get sequential batch (for deterministic evaluation)
-    pub fn get_sequential_batch(&self, start_idx: usize, batch_size: usize) -> Result<(Tensor, Tensor)> {
+    pub fn get_sequential_batch(
+        &self,
+        start_idx: usize,
+        batch_size: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let num_seqs = self.len();
         let end_idx = (start_idx + batch_size).min(num_seqs);
 
         if start_idx >= num_seqs {
-            return Err(candle_core::Error::Msg("Start index out of bounds".to_string()));
+            return Err(candle_core::Error::Msg(
+                "Start index out of bounds".to_string(),
+            ));
         }
 
         let batch_indices: Vec<usize> = (start_idx..end_idx).collect();
@@ -248,30 +250,30 @@ pub fn prepare_training_data(
     println!("\n📚 Building vocabulary...");
     let vocab = SimpleTokenizer::build_vocab_from_file(text_path, vocab_size)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to build vocab: {}", e)))?;
-    println!("   Vocabulary size: {}", vocab.len());
+    println!(
+        "   Base vocabulary size (without specials): {}",
+        vocab.len()
+    );
 
     // Create tokenizer
     let tokenizer = SimpleTokenizer::new(vocab.clone());
+    println!("   Final tokenizer size: {}", tokenizer.vocab_size());
 
     // Save tokenizer
-    tokenizer.save(&tokenizer_path)
+    tokenizer
+        .save(&tokenizer_path)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to save tokenizer: {}", e)))?;
     println!("   Saved tokenizer to {:?}", tokenizer_path);
 
     // Load and tokenize data
     println!("\n🔤 Tokenizing data...");
-    let dataset = TextDataset::from_file(
-        text_path,
-        tokenizer.clone(),
-        seq_len,
-        &Device::Cpu,
-    )?;
+    let dataset = TextDataset::from_file(text_path, tokenizer.clone(), seq_len, &Device::Cpu)?;
 
     // Save to binary
     dataset.save_to_bin(&bin_path)?;
 
     println!("\n✅ Data preparation complete!");
-    println!("   Vocabulary: {} tokens", vocab.len());
+    println!("   Vocabulary: {} tokens", tokenizer.vocab_size());
     println!("   Dataset: {} sequences", dataset.len());
 
     Ok(tokenizer)
@@ -281,6 +283,12 @@ pub fn prepare_training_data(
 ///
 /// Generates some sample Chinese text for quick testing
 pub fn create_dummy_training_data(path: &Path, num_lines: usize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            candle_core::Error::Msg(format!("Failed to create parent directory: {}", e))
+        })?;
+    }
+
     let mut file = File::create(path)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to create file: {}", e)))?;
 
@@ -321,6 +329,9 @@ pub fn create_dummy_training_data(path: &Path, num_lines: usize) -> Result<()> {
             .map_err(|e| candle_core::Error::Msg(format!("Failed to write: {}", e)))?;
     }
 
-    println!("📝 Created dummy training data: {:?} ({} lines)", path, num_lines);
+    println!(
+        "📝 Created dummy training data: {:?} ({} lines)",
+        path, num_lines
+    );
     Ok(())
 }

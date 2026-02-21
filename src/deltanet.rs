@@ -1,551 +1,563 @@
-use candle_core::{Result, Tensor, Device, DType};
-use candle_nn::ops;
+use candle_core::{DType, Device, Result, Tensor};
+use rand::Rng;
 
+use crate::activation::apply_hidden_act;
+use crate::activation::sigmoid;
+use crate::cache::Qwen3NextDynamicCache;
+use crate::conv::{FusedRMSNormSwishGate, ShortConvolution};
+use crate::trainable::make_trainable;
 use crate::Config;
-use crate::conv::{ShortConvolution, FusedRMSNormSwishGate};
 
-/// Gated DeltaNet layer (Full Implementation aligned with official NVlabs specification)
+/// Gated DeltaNet aligned with the official Qwen3-Next recurrence path.
 ///
-/// Implements linear attention using the delta rule with efficient scan.
-///
-/// Based on "Gated Delta Networks: Improving Mamba2 with Delta Rule" (ICLR 2025)
-/// Official implementation: https://github.com/NVlabs/GatedDeltaNet
-///
-/// Architecture:
-/// - Q, K, V projections with corrected dimensions (Q,K: d_model, V: 2*d_model)
-/// - ShortConvolution on Q, K, V (kernel_size=4)
-/// - Lambda (decay): learnable time-variant decay
-/// - A (alpha/forget gate): independent forget gate, NOT just (1-lambda)
-/// - B (gate): gating mechanism for output
-/// - G (gate projection): output gating before final projection
-/// - FusedRMSNormSwishGate: normalization + swish activation
-/// - Efficient O(L) serial scan using cumulative products (for CPU/small sequences)
-///   Note: True O(L log L) parallel scan requires GPU kernels and associative scan
-/// - Head-to-state projection: learnable matrix to project head_dim to state_dim
-///
-/// Forward pass:
-/// 1. Project input to Q, K, V, B, A, Lambda, G
-/// 2. Apply ShortConvolution to Q, K, V
-/// 3. Compute state evolution using efficient cumulative product/sum
-/// 4. Apply output gating and normalization
-/// 5. Final projection to d_model
+/// Key points:
+/// - `in_proj_qkvz` jointly projects q/k/v/z.
+/// - `in_proj_ba` projects beta and a.
+/// - depthwise short convolution on concatenated qkv.
+/// - recurrent gated-delta-rule update with `g = -exp(A_log) * softplus(a + dt_bias)`.
+/// - RMSNormGated before `out_proj`.
 #[derive(Clone)]
 pub struct GatedDeltaNet {
-    // Q projection: (d_model, d_model)
-    pub q_proj: Tensor,
-    // K projection: (d_model, d_model)
-    pub k_proj: Tensor,
-    // V projection: (d_model, v_dim) where v_dim = 2*d_model
-    pub v_proj: Tensor,
-    // B (gate) projection: (d_model, n_heads)
-    pub b_proj: Tensor,
-    // A (alpha/forget gate) projection: (d_model, n_heads) - independent forget gate
-    pub a_proj: Tensor,
-    // Lambda (decay) projection: (d_model, n_heads)
-    pub lambda_proj: Tensor,
-    // G (output gate) projection: (d_model, v_dim)
-    pub g_proj: Tensor,
-    // Output projection: (v_dim, d_model)
-    pub o_proj: Tensor,
+    /// Input projection for q, k, v, z.
+    pub in_proj_qkvz: Tensor,
+    /// Input projection for beta and a.
+    pub in_proj_ba: Tensor,
+    /// Discretization bias.
+    pub dt_bias: Tensor,
+    /// Decay parameter in log space.
+    pub a_log: Tensor,
+    /// Output projection.
+    pub out_proj: Tensor,
 
-    // Head-to-state projection: (head_dim, state_dim)
-    // This learnable matrix projects q (head_dim) to state_dim for output computation
-    // and also projects k (head_dim) to state_dim for the content computation
-    pub head_to_state_proj: Tensor,
+    conv1d: ShortConvolution,
+    norm: FusedRMSNormSwishGate,
 
-    // ShortConvolution layers
-    q_conv: ShortConvolution,
-    k_conv: ShortConvolution,
-    v_conv: ShortConvolution,
-
-    // Output normalization
-    o_norm: FusedRMSNormSwishGate,
-
-    // Dimensions
-    d_state: usize,
     d_model: usize,
-    v_dim: usize,
-    n_heads: usize,
-    head_dim: usize,
-    state_dim: usize,  // State dimension per head (v_dim / n_heads)
-
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    hidden_act: String,
+    use_fast_kernels: bool,
     device: Device,
 }
 
 impl GatedDeltaNet {
     pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
         let d_model = cfg.d_model;
-        let d_state = cfg.d_state;
-        let n_heads = cfg.n_heads;
-        let head_dim = d_model / n_heads;
+        let num_v_heads = cfg.linear_num_value_heads;
+        let num_k_heads = cfg.linear_num_key_heads;
+        let head_k_dim = cfg.linear_key_head_dim;
+        let head_v_dim = cfg.linear_value_head_dim;
 
-        // V dimension: 2*d_model for better capacity
-        // This must be divisible by n_heads for proper head-wise processing
-        let v_dim = 2 * d_model;
-
-        // Validate that v_dim is divisible by n_heads
-        if v_dim % n_heads != 0 {
-            return Err(candle_core::Error::Msg(
-                format!("v_dim ({}) must be divisible by n_heads ({})", v_dim, n_heads)
-            ));
+        if num_v_heads % num_k_heads != 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "num_v_heads ({}) must be divisible by num_k_heads ({})",
+                num_v_heads, num_k_heads
+            )));
         }
 
-        let state_dim = v_dim / n_heads;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let conv_dim = 2 * key_dim + value_dim;
 
-        // DeltaNet-specific scaling
-        let std = (2.0 / (5 * d_model) as f64).sqrt();
-
-        // Q: (d_model, d_model)
-        let q_proj = Tensor::randn(0.0, std, (d_model, d_model), device)?
+        let std = cfg.initializer_range;
+        let in_proj_qkvz = Tensor::randn(
+            0f32,
+            std as f32,
+            (d_model, 2 * key_dim + 2 * value_dim),
+            device,
+        )?
+        .to_dtype(DType::F32)?;
+        let in_proj_qkvz = make_trainable(in_proj_qkvz)?;
+        let in_proj_ba = Tensor::randn(0f32, std as f32, (d_model, 2 * num_v_heads), device)?
             .to_dtype(DType::F32)?;
-
-        // K: (d_model, d_model)
-        let k_proj = Tensor::randn(0.0, std, (d_model, d_model), device)?
+        let in_proj_ba = make_trainable(in_proj_ba)?;
+        let out_proj = Tensor::randn(0f32, std as f32, (value_dim, d_model), device)?
             .to_dtype(DType::F32)?;
+        let out_proj = make_trainable(out_proj)?;
 
-        // V: (d_model, v_dim)
-        let v_proj = Tensor::randn(0.0, std, (d_model, v_dim), device)?
-            .to_dtype(DType::F32)?;
+        let dt_bias = Tensor::ones(&[num_v_heads], DType::F32, device)?;
+        let dt_bias = make_trainable(dt_bias)?;
 
-        // B (gate): (d_model, n_heads) - for element-wise gating
-        let b_proj = Tensor::randn(0.0, std, (d_model, n_heads), device)?
-            .to_dtype(DType::F32)?;
+        let mut rng = rand::thread_rng();
+        let mut a_init = Vec::with_capacity(num_v_heads);
+        for _ in 0..num_v_heads {
+            let v = rng.gen_range(0.0f32..16.0f32);
+            a_init.push(v.ln());
+        }
+        let a_log = Tensor::new(a_init.as_slice(), device)?;
+        let a_log = make_trainable(a_log)?;
 
-        // A (alpha/forget gate): (d_model, n_heads) - independent forget gate
-        let a_proj = Tensor::randn(0.0, std, (d_model, n_heads), device)?
-            .to_dtype(DType::F32)?;
-
-        // Lambda (decay): (d_model, n_heads)
-        let lambda_proj = Tensor::randn(0.0, std, (d_model, n_heads), device)?
-            .to_dtype(DType::F32)?;
-
-        // G (output gate): (d_model, v_dim)
-        let g_proj = Tensor::randn(0.0, std, (d_model, v_dim), device)?
-            .to_dtype(DType::F32)?;
-
-        // O: (v_dim, d_model)
-        let o_proj = Tensor::randn(0.0, std, (v_dim, d_model), device)?
-            .to_dtype(DType::F32)?;
-
-        // Head-to-state projection: (head_dim, state_dim)
-        // This is a LEARNABLE parameter that projects q and k from head_dim to state_dim
-        // Use Kaiming initialization for better training stability
-        let h2s_std = (2.0 / (head_dim as f64)).sqrt();
-        let head_to_state_proj = Tensor::randn(0.0, h2s_std, (head_dim, state_dim), device)?
-            .to_dtype(DType::F32)?;
-
-        // ShortConvolution layers
-        let q_conv = ShortConvolution::new(d_model, d_model, 4, device)?;
-        let k_conv = ShortConvolution::new(d_model, d_model, 4, device)?;
-        let v_conv = ShortConvolution::new(v_dim, v_dim, 4, device)?;
-
-        // Output normalization
-        let o_norm = FusedRMSNormSwishGate::new(v_dim, device)?;
+        let conv1d = ShortConvolution::new(
+            conv_dim,
+            conv_dim,
+            cfg.linear_conv_kernel_dim,
+            cfg.initializer_range,
+            device,
+        )?;
+        let norm =
+            FusedRMSNormSwishGate::new(head_v_dim, cfg.rms_norm_eps, &cfg.hidden_act, device)?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            b_proj,
-            a_proj,
-            lambda_proj,
-            g_proj,
-            o_proj,
-            head_to_state_proj,
-            q_conv,
-            k_conv,
-            v_conv,
-            o_norm,
-            d_state,
+            in_proj_qkvz,
+            in_proj_ba,
+            dt_bias,
+            a_log,
+            out_proj,
+            conv1d,
+            norm,
             d_model,
-            v_dim,
-            n_heads,
-            head_dim,
-            state_dim,
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            hidden_act: cfg.hidden_act.clone(),
+            use_fast_kernels: cfg.use_fast_kernels,
             device: device.clone(),
         })
     }
 
-    /// Forward pass with efficient scan
-    ///
-    /// Input shape: (batch_size, seq_len, d_model)
-    /// Output shape: (batch_size, seq_len, d_model)
-    ///
-    /// Note: This uses an O(L) serial scan implementation. For true O(L log L)
-    /// parallel scan, GPU kernels with associative scan would be required.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, d_model) = x.dims3()?;
-
-        // Project to Q, K, V, B, A, Lambda, G
-        let x_2d = x.reshape(&[batch_size * seq_len, d_model])?;
-
-        // Q: (B*L, d_model) -> (B, L, d_model)
-        let q = x_2d.matmul(&self.q_proj)?.reshape(&[batch_size, seq_len, d_model])?;
-        // K: (B*L, d_model) -> (B, L, d_model)
-        let k = x_2d.matmul(&self.k_proj)?.reshape(&[batch_size, seq_len, d_model])?;
-        // V: (B*L, v_dim) -> (B, L, v_dim)
-        let v = x_2d.matmul(&self.v_proj)?.reshape(&[batch_size, seq_len, self.v_dim])?;
-
-        // Apply ShortConvolution to Q, K, V
-        let q = self.q_conv.forward(&q)?;
-        let k = self.k_conv.forward(&k)?;
-        let v = self.v_conv.forward(&v)?;
-
-        // Apply SiLU activation to Q, K, V (per official Gated DeltaNet specification)
-        // Paper ablation study (Table S.1) shows SiLU consistently outperforms other activations
-        let q = ops::silu(&q)?;
-        let k = ops::silu(&k)?;
-        let v = ops::silu(&v)?;
-
-        // Apply L2 normalization to Q and K only (per official specification)
-        // Paper ablation shows L2-norm: 47.26% vs L1-norm: 45.92% accuracy
-        let q = l2_normalize(&q)?;
-        let k = l2_normalize(&k)?;
-
-        // B, A, Lambda: (B*L, n_heads) -> (B, L, n_heads)
-        let b_gate = x_2d.matmul(&self.b_proj)?.reshape(&[batch_size, seq_len, self.n_heads])?;
-        let a_gate = x_2d.matmul(&self.a_proj)?.reshape(&[batch_size, seq_len, self.n_heads])?;
-        let lambda = x_2d.matmul(&self.lambda_proj)?.reshape(&[batch_size, seq_len, self.n_heads])?;
-
-        // G: (B*L, v_dim) -> (B, L, v_dim)
-        let g = x_2d.matmul(&self.g_proj)?.reshape(&[batch_size, seq_len, self.v_dim])?;
-
-        // Apply activations
-        // lambda: use sigmoid to get values in (0, 1) range
-        let lambda = ops::sigmoid(&lambda)?;  // (B, L, n_heads) in (0, 1)
-
-        // a (alpha/forget gate): sigmoid for (0, 1)
-        let a_gate = ops::sigmoid(&a_gate)?;
-
-        // b (output gate): sigmoid
-        let b_gate = ops::sigmoid(&b_gate)?;
-
-        // DeltaNet core computation
-        // Reshape for head-wise processing
-        let q = self.reshape_to_heads(&q)?;  // (B, L, n_heads, head_dim)
-        let k = self.reshape_to_heads(&k)?;  // (B, L, n_heads, head_dim)
-        let v = v.reshape(&[batch_size, seq_len, self.n_heads, self.state_dim])?;  // (B, L, n_heads, state_dim)
-
-        // Expand gates for broadcasting
-        let b_gate = b_gate.unsqueeze(3)?;  // (B, L, n_heads, 1)
-        let a_gate = a_gate.unsqueeze(3)?;  // (B, L, n_heads, 1)
-        let lambda = lambda.unsqueeze(3)?;  // (B, L, n_heads, 1)
-
-        let y = self.deltanet_compute(&q, &k, &v, &b_gate, &a_gate, &lambda)?;  // (B, L, n_heads, state_dim)
-
-        // Merge heads: (B, L, v_dim)
-        let y = y.reshape(&[batch_size, seq_len, self.v_dim])?;
-
-        // Apply output gating and normalization
-        let y = self.o_norm.forward(&y, &g)?;
-
-        // Output projection: (B, L, v_dim) -> (B, L, d_model)
-        let y_2d = y.reshape(&[batch_size * seq_len, self.v_dim])?;
-        let output = y_2d.matmul(&self.o_proj)?.reshape(&[batch_size, seq_len, d_model])?;
-
-        Ok(output)
+        self.forward_with_cache(x, None, 0, None)
     }
 
-    /// Reshape tensor from (B, L, d_model) to (B, L, n_heads, head_dim)
-    fn reshape_to_heads(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, l, d) = x.dims3()?;
-        x.reshape(&[b, l, self.n_heads, self.head_dim])
-    }
-
-    /// DeltaNet core computation
-    ///
-    /// The recurrence is:
-    ///   h_t = lambda_t * h_{t-1} + a_t * (k_t @ v_t)
-    ///   y_t = (q_t @ h_t) * b_t
-    ///
-    /// where:
-    /// - q_t: (head_dim,) query at position t
-    /// - k_t: (head_dim,) key at position t
-    /// - v_t: (state_dim,) value at position t
-    /// - h_t: (state_dim,) hidden state at position t
-    /// - a_t: forget gate (independent from lambda)
-    /// - lambda_t: decay rate
-    /// - b_t: output gate
-    ///
-    /// Key insight: we project q_t (head_dim) to state_dim via learned mixing
-    /// rather than simple repetition. This allows flexible dimension handling.
-    fn deltanet_compute(
+    pub fn forward_with_cache(
         &self,
-        q: &Tensor,      // (B, L, n_heads, head_dim)
-        k: &Tensor,      // (B, L, n_heads, head_dim)
-        v: &Tensor,      // (B, L, n_heads, state_dim)
-        b_gate: &Tensor, // (B, L, n_heads, 1)
-        a_gate: &Tensor, // (B, L, n_heads, 1)
-        lambda: &Tensor, // (B, L, n_heads, 1)
+        x: &Tensor,
+        cache: Option<&mut Qwen3NextDynamicCache>,
+        layer_idx: usize,
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (batch_size, seq_len, n_heads, head_dim) = q.dims4()?;
-        let (_, _, _, state_dim) = v.dims4()?;
+        let hidden_states = apply_mask_to_padding_states(x, attention_mask)?;
+        let (batch_size, seq_len, d_model) = hidden_states.dims3()?;
+        let x_2d = hidden_states.reshape(&[batch_size * seq_len, d_model])?;
 
-        // Use the LEARNED head-to-state projection matrix
-        // This is stored as a model parameter, not randomly created each forward pass
-        let h2s_proj = &self.head_to_state_proj;
+        let mixed_qkvz = x_2d.matmul(&self.in_proj_qkvz)?.reshape(&[
+            batch_size,
+            seq_len,
+            2 * self.key_dim + 2 * self.value_dim,
+        ])?;
+        let mixed_ba =
+            x_2d.matmul(&self.in_proj_ba)?
+                .reshape(&[batch_size, seq_len, 2 * self.num_v_heads])?;
 
-        // Process each batch and head
+        let (query, key, value, z, beta, a) =
+            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba)?;
+
+        let query_flat = query.reshape(&[batch_size, seq_len, self.key_dim])?;
+        let key_flat = key.reshape(&[batch_size, seq_len, self.key_dim])?;
+        let value_flat = value.reshape(&[batch_size, seq_len, self.value_dim])?;
+
+        let mixed_qkv = Tensor::cat(&[&query_flat, &key_flat, &value_flat], 2)?;
+        let mut cache = cache;
+        let prev_conv_state = cache.as_deref_mut().and_then(|c| c.conv_state(layer_idx));
+        let (mixed_qkv, new_conv_state) = if self.use_fast_kernels {
+            self.conv1d
+                .forward_with_state(&mixed_qkv, prev_conv_state.as_ref())?
+        } else {
+            self.conv1d
+                .forward_with_state_reference(&mixed_qkv, prev_conv_state.as_ref())?
+        };
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.set_conv_state(layer_idx, new_conv_state)?;
+        }
+        let mixed_qkv = apply_hidden_act(&mixed_qkv, &self.hidden_act)?;
+
+        let query = mixed_qkv.narrow(2, 0, self.key_dim)?.reshape(&[
+            batch_size,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let key = mixed_qkv.narrow(2, self.key_dim, self.key_dim)?.reshape(&[
+            batch_size,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let value = mixed_qkv
+            .narrow(2, 2 * self.key_dim, self.value_dim)?
+            .reshape(&[batch_size, seq_len, self.num_v_heads, self.head_v_dim])?;
+
+        let beta = sigmoid(&beta)?;
+        let dt_bias = self.dt_bias.reshape(&[1, 1, self.num_v_heads])?;
+        let a_plus_bias = a.broadcast_add(&dt_bias)?;
+        let g = self.a_log.exp()?.reshape(&[1, 1, self.num_v_heads])?;
+        let g = g.broadcast_mul(&softplus(&a_plus_bias)?)?;
+        let g = g.affine(-1.0, 0.0)?;
+
+        let repeat_factor = self.num_v_heads / self.num_k_heads;
+        let query = if repeat_factor > 1 {
+            self.repeat_heads(query, repeat_factor)?
+        } else {
+            query
+        };
+        let key = if repeat_factor > 1 {
+            self.repeat_heads(key, repeat_factor)?
+        } else {
+            key
+        };
+
+        let prev_recurrent_state = cache
+            .as_deref_mut()
+            .and_then(|c| c.recurrent_state(layer_idx));
+        let (core_attn_out, final_recurrent_state) = if self.use_fast_kernels {
+            self.recurrent_gated_delta_rule_fast(
+                &query,
+                &key,
+                &value,
+                &g,
+                &beta,
+                prev_recurrent_state.as_ref(),
+            )?
+        } else {
+            self.recurrent_gated_delta_rule_reference(
+                &query,
+                &key,
+                &value,
+                &g,
+                &beta,
+                prev_recurrent_state.as_ref(),
+            )?
+        };
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.set_recurrent_state(layer_idx, final_recurrent_state)?;
+        }
+        let core_attn_out = self.norm.forward(&core_attn_out, &z)?;
+
+        let core_attn_out_2d = core_attn_out.reshape(&[batch_size * seq_len, self.value_dim])?;
+        core_attn_out_2d
+            .matmul(&self.out_proj)?
+            .reshape(&[batch_size, seq_len, self.d_model])
+    }
+
+    fn fix_query_key_value_ordering(
+        &self,
+        mixed_qkvz: &Tensor,
+        mixed_ba: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        let (b, l, _) = mixed_qkvz.dims3()?;
+        let v_per_group = self.num_v_heads / self.num_k_heads;
+        let grouped_v_dim = v_per_group * self.head_v_dim;
+
+        let qkvz = mixed_qkvz.reshape(&[
+            b,
+            l,
+            self.num_k_heads,
+            2 * self.head_k_dim + 2 * grouped_v_dim,
+        ])?;
+        let ba = mixed_ba.reshape(&[b, l, self.num_k_heads, 2 * v_per_group])?;
+
+        let query = qkvz.narrow(3, 0, self.head_k_dim)?;
+        let key = qkvz.narrow(3, self.head_k_dim, self.head_k_dim)?;
+        let value = qkvz
+            .narrow(3, 2 * self.head_k_dim, grouped_v_dim)?
+            .reshape(&[b, l, self.num_v_heads, self.head_v_dim])?;
+        let z = qkvz
+            .narrow(3, 2 * self.head_k_dim + grouped_v_dim, grouped_v_dim)?
+            .reshape(&[b, l, self.num_v_heads, self.head_v_dim])?;
+
+        let beta = ba
+            .narrow(3, 0, v_per_group)?
+            .reshape(&[b, l, self.num_v_heads])?;
+        let a = ba
+            .narrow(3, v_per_group, v_per_group)?
+            .reshape(&[b, l, self.num_v_heads])?;
+
+        Ok((query, key, value, z, beta, a))
+    }
+
+    fn repeat_heads(&self, x: Tensor, repeat_factor: usize) -> Result<Tensor> {
+        let (_, _, n_heads, _) = x.dims4()?;
+        let mut repeated = Vec::with_capacity(n_heads * repeat_factor);
+        for i in 0..n_heads {
+            let head = x.narrow(2, i, 1)?;
+            for _ in 0..repeat_factor {
+                repeated.push(head.clone());
+            }
+        }
+        Tensor::cat(&repeated, 2)
+    }
+
+    /// Optimized recurrent gated-delta rule:
+    /// - keeps the required recurrence over sequence length
+    /// - vectorizes across batch and heads
+    /// - preserves gradients for `g` and `beta` (no scalar extraction)
+    fn recurrent_gated_delta_rule_fast(
+        &self,
+        query: &Tensor,                 // (B, L, H, K)
+        key: &Tensor,                   // (B, L, H, K)
+        value: &Tensor,                 // (B, L, H, V)
+        g: &Tensor,                     // (B, L, H)
+        beta: &Tensor,                  // (B, L, H)
+        initial_state: Option<&Tensor>, // (B, H, K, V)
+    ) -> Result<(Tensor, Tensor)> {
+        let query = l2_normalize_last(query)?;
+        let key = l2_normalize_last(key)?;
+
+        let (batch_size, seq_len, num_heads, k_dim) = key.dims4()?;
+        let (_, _, _, v_dim) = value.dims4()?;
+
+        let scale = Tensor::new(1.0f32 / (k_dim as f32).sqrt(), query.device())?;
+        let query = query.broadcast_mul(&scale)?;
+
+        let mut state = if let Some(initial_state) = initial_state {
+            initial_state.clone()
+        } else {
+            Tensor::zeros(
+                &[batch_size, num_heads, k_dim, v_dim],
+                DType::F32,
+                query.device(),
+            )?
+        };
+
+        let mut outputs = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let q_t = query
+                .narrow(1, t, 1)?
+                .reshape(&[batch_size, num_heads, k_dim])?;
+            let k_t = key
+                .narrow(1, t, 1)?
+                .reshape(&[batch_size, num_heads, k_dim])?;
+            let v_t = value
+                .narrow(1, t, 1)?
+                .reshape(&[batch_size, num_heads, v_dim])?;
+
+            let g_t = g.narrow(1, t, 1)?.reshape(&[batch_size, num_heads, 1, 1])?;
+            let beta_t = beta.narrow(1, t, 1)?.reshape(&[batch_size, num_heads, 1])?;
+
+            state = state.broadcast_mul(&g_t.exp()?)?;
+
+            let k_t_exp = k_t.reshape(&[batch_size, num_heads, k_dim, 1])?;
+            let kv_mem = state.broadcast_mul(&k_t_exp)?.sum_keepdim(2)?.squeeze(2)?; // (B, H, V)
+            let delta = v_t.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_t)?;
+
+            let update =
+                k_t_exp.broadcast_mul(&delta.reshape(&[batch_size, num_heads, 1, v_dim])?)?;
+            state = state.broadcast_add(&update)?;
+
+            let y_t = state
+                .broadcast_mul(&q_t.reshape(&[batch_size, num_heads, k_dim, 1])?)?
+                .sum_keepdim(2)?
+                .squeeze(2)?; // (B, H, V)
+            outputs.push(y_t.reshape(&[batch_size, 1, num_heads, v_dim])?);
+        }
+
+        let output_refs: Vec<&Tensor> = outputs.iter().collect();
+        let output = Tensor::cat(output_refs.as_slice(), 1)?; // (B, L, H, V)
+        Ok((output, state))
+    }
+
+    /// Reference implementation kept for parity checks.
+    fn recurrent_gated_delta_rule_reference(
+        &self,
+        query: &Tensor,                 // (B, L, H, K)
+        key: &Tensor,                   // (B, L, H, K)
+        value: &Tensor,                 // (B, L, H, V)
+        g: &Tensor,                     // (B, L, H)
+        beta: &Tensor,                  // (B, L, H)
+        initial_state: Option<&Tensor>, // (B, H, K, V)
+    ) -> Result<(Tensor, Tensor)> {
+        let query = l2_normalize_last(query)?;
+        let key = l2_normalize_last(key)?;
+
+        let (_, _, _, k_dim) = key.dims4()?;
+        let scale = Tensor::new(1.0f32 / (k_dim as f32).sqrt(), &self.device)?;
+        let query = query.broadcast_mul(&scale)?;
+
+        let (batch_size, seq_len, num_heads, k_dim) = key.dims4()?;
+        let (_, _, _, v_dim) = value.dims4()?;
         let mut all_outputs = Vec::with_capacity(batch_size);
+        let mut all_final_states = Vec::with_capacity(batch_size);
 
         for batch_idx in 0..batch_size {
-            let mut batch_outputs = Vec::with_capacity(n_heads);
+            let mut batch_outputs = Vec::with_capacity(num_heads);
+            let mut batch_final_states = Vec::with_capacity(num_heads);
+            for head_idx in 0..num_heads {
+                let q_bh = query
+                    .narrow(0, batch_idx, 1)?
+                    .narrow(2, head_idx, 1)?
+                    .reshape(&[seq_len, k_dim])?;
+                let k_bh = key
+                    .narrow(0, batch_idx, 1)?
+                    .narrow(2, head_idx, 1)?
+                    .reshape(&[seq_len, k_dim])?;
+                let v_bh = value
+                    .narrow(0, batch_idx, 1)?
+                    .narrow(2, head_idx, 1)?
+                    .reshape(&[seq_len, v_dim])?;
+                let g_bh = g
+                    .narrow(0, batch_idx, 1)?
+                    .narrow(2, head_idx, 1)?
+                    .reshape(&[seq_len])?;
+                let beta_bh = beta
+                    .narrow(0, batch_idx, 1)?
+                    .narrow(2, head_idx, 1)?
+                    .reshape(&[seq_len])?;
 
-            for head_idx in 0..n_heads {
-                // Extract tensors for this batch and head
-                let q_bh = q.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let q_bh = q_bh.reshape(&[seq_len, head_dim])?;
+                let mut state = if let Some(initial_state) = initial_state {
+                    initial_state
+                        .narrow(0, batch_idx, 1)?
+                        .narrow(1, head_idx, 1)?
+                        .reshape(&[k_dim, v_dim])?
+                } else {
+                    Tensor::zeros(&[k_dim, v_dim], DType::F32, &self.device)?
+                };
+                let mut head_outputs = Vec::with_capacity(seq_len);
 
-                let k_bh = k.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let k_bh = k_bh.reshape(&[seq_len, head_dim])?;
+                for t in 0..seq_len {
+                    let q_t = q_bh.narrow(0, t, 1)?.reshape(&[k_dim])?;
+                    let k_t = k_bh.narrow(0, t, 1)?.reshape(&[k_dim])?;
+                    let v_t = v_bh.narrow(0, t, 1)?.reshape(&[v_dim])?;
+                    let g_t = g_bh.narrow(0, t, 1)?.reshape(&[])?.to_scalar::<f32>()?;
+                    let beta_t = beta_bh.narrow(0, t, 1)?.reshape(&[])?.to_scalar::<f32>()?;
 
-                let v_bh = v.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let v_bh = v_bh.reshape(&[seq_len, state_dim])?;
+                    let g_exp = Tensor::new(g_t.exp(), &self.device)?;
+                    state = state.broadcast_mul(&g_exp)?;
 
-                let b_bh = b_gate.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let b_bh = b_bh.reshape(&[seq_len, 1])?;
+                    let kv_mem = k_t
+                        .reshape(&[1, k_dim])?
+                        .matmul(&state)?
+                        .reshape(&[v_dim])?;
+                    let delta = v_t.broadcast_sub(&kv_mem)?;
+                    let beta_t = Tensor::new(beta_t, &self.device)?;
+                    let delta = delta.broadcast_mul(&beta_t)?;
 
-                let a_bh = a_gate.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let a_bh = a_bh.reshape(&[seq_len, 1])?;
+                    let update = k_t
+                        .reshape(&[k_dim, 1])?
+                        .matmul(&delta.reshape(&[1, v_dim])?)?;
+                    state = state.broadcast_add(&update)?;
 
-                let lambda_bh = lambda.narrow(0, batch_idx, 1)?.narrow(1, 0, seq_len)?.narrow(2, head_idx, 1)?;
-                let lambda_bh = lambda_bh.reshape(&[seq_len, 1])?;
+                    let y_t = q_t
+                        .reshape(&[1, k_dim])?
+                        .matmul(&state)?
+                        .reshape(&[v_dim])?;
+                    head_outputs.push(y_t);
+                }
 
-                // Project q to state_dim for output computation using LEARNED matrix
-                let q_projected = q_bh.matmul(h2s_proj)?;  // (L, state_dim)
-
-                // Compute content: k @ v
-                // k: (L, head_dim), need to project to state_dim
-                let k_projected = k_bh.matmul(h2s_proj)?;  // (L, state_dim)
-                let kv = k_projected.broadcast_mul(&v_bh)?;  // (L, state_dim)
-
-                // Run scan
-                let head_out = self.deltanet_scan_with_projection(
-                    &q_projected, &kv, &b_bh, &a_bh, &lambda_bh
-                )?;
-
+                let head_out = Tensor::cat(&head_outputs, 0)?.reshape(&[seq_len, v_dim])?;
                 batch_outputs.push(head_out);
+                batch_final_states.push(state);
             }
 
-            // Stack heads
-            let stacked = Tensor::cat(&batch_outputs, 0)?;
-            let stacked = stacked.reshape(&[n_heads, seq_len, state_dim])?;
-            let stacked = stacked.transpose(0, 1)?;
+            let stacked = Tensor::cat(&batch_outputs, 0)?
+                .reshape(&[num_heads, seq_len, v_dim])?
+                .transpose(0, 1)?;
             all_outputs.push(stacked);
+
+            let final_state =
+                Tensor::cat(&batch_final_states, 0)?.reshape(&[num_heads, k_dim, v_dim])?;
+            all_final_states.push(final_state);
         }
 
-        // Stack batches
         let stacked = Tensor::cat(&all_outputs, 0)?;
-        stacked.reshape(&[batch_size, seq_len, n_heads, state_dim])
+        let output = stacked.reshape(&[batch_size, seq_len, num_heads, v_dim])?;
+        let final_state =
+            Tensor::cat(&all_final_states, 0)?.reshape(&[batch_size, num_heads, k_dim, v_dim])?;
+        Ok((output, final_state))
     }
 
-    /// DeltaNet scan with q already projected to state dimension
-    ///
-    /// Recurrence:
-    ///   h_t = lambda_t * h_{t-1} + a_t * kv_t
-    ///   y_t = q_t * h_t * b_t
-    ///
-    /// where all vectors (q_t, h_t, kv_t) have the same dimension (state_dim)
-    ///
-    /// This implementation uses a numerically stable log-space algorithm
-    /// to avoid division issues when lambda values are small.
-    ///
-    /// The key insight is:
-    ///   prod_{i=j+1}^{t} lambda_i = exp(sum_{i=j+1}^{t} log(lambda_i))
-    ///
-    /// This is much more stable than computing products and then dividing.
-    fn deltanet_scan_with_projection(
-        &self,
-        q: &Tensor,      // (L, state_dim) - already projected
-        kv: &Tensor,     // (L, state_dim)
-        b_gate: &Tensor, // (L, 1)
-        a_gate: &Tensor, // (L, 1)
-        lambda: &Tensor, // (L, 1)
-    ) -> Result<Tensor> {
-        let (seq_len, state_dim) = kv.dims2()?;
-
-        // For short sequences (< 128), use simple serial scan (less overhead)
-        if seq_len < 128 {
-            return self.deltanet_scan_serial(q, kv, b_gate, a_gate, lambda);
-        }
-
-        // Numerically stable log-space scan algorithm
-        // This avoids the division instability of the original implementation
-
-        // Expand lambda and a_gate to match state dimension: (L, state_dim)
-        let ones = Tensor::ones(&[1, state_dim], DType::F32, &self.device)?;
-        let lambda_expanded = lambda.broadcast_mul(&ones)?;  // (L, state_dim)
-        let a_expanded = a_gate.broadcast_mul(&ones)?;       // (L, state_dim)
-
-        // Compute a_t * kv_t: (L, state_dim)
-        let a_kv = a_expanded.broadcast_mul(kv)?;
-
-        // Clamp lambda to avoid log(0) - use small epsilon
-        let eps = 1e-8f32;
-        let eps_tensor = Tensor::new(eps, &self.device)?;
-        let lambda_safe = lambda_expanded.broadcast_add(&eps_tensor)?;
-
-        // Compute log(lambda): log_lambda[t] = log(lambda_t)
-        let mut log_lambda = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let lambda_t = lambda_safe.narrow(0, t, 1)?.reshape(&[state_dim])?;
-            // Use natural log for numerical stability
-            let log_t = lambda_t.log()?;
-            log_lambda.push(log_t);
-        }
-
-        // Compute cumulative sum of log(lambda): cumsum_log[t] = sum_{i=0}^{t} log(lambda_i)
-        let mut cumsum_log = Vec::with_capacity(seq_len);
-        let mut running_sum = Tensor::zeros(&[state_dim], DType::F32, &self.device)?;
-
-        for t in 0..seq_len {
-            running_sum = running_sum.broadcast_add(&log_lambda[t])?;
-            cumsum_log.push(running_sum.clone());
-        }
-
-        // Total sum of all log(lambda)
-        let total_log_sum = cumsum_log.last().unwrap().clone();
-
-        // Compute reverse cumulative sum of log(lambda)
-        // rev_cumsum_log[t] = sum_{i=t+1}^{L-1} log(lambda_i) = total_log_sum - cumsum_log[t]
-        let mut rev_cumsum_log = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            if t == seq_len - 1 {
-                // Last element: no future lambdas, so sum is 0
-                rev_cumsum_log.push(Tensor::zeros(&[state_dim], DType::F32, &self.device)?);
-            } else {
-                // rev_cumsum_log[t] = total_log_sum - cumsum_log[t]
-                let diff = total_log_sum.broadcast_sub(&cumsum_log[t])?;
-                rev_cumsum_log.push(diff);
-            }
-        }
-
-        // Compute weighted content: a_kv_t * exp(rev_cumsum_log[t])
-        // Then compute cumulative sum
-        let mut weighted = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            let a_kv_t = a_kv.narrow(0, t, 1)?.reshape(&[state_dim])?;
-            // exp of the reverse cumsum gives us the product of future lambdas
-            let decay_factor = rev_cumsum_log[t].exp()?;
-            let w_t = a_kv_t.broadcast_mul(&decay_factor)?;
-            weighted.push(w_t);
-        }
-
-        // Cumulative sum of weighted content
-        let mut cumsum = Vec::with_capacity(seq_len);
-        let mut running_sum = Tensor::zeros(&[state_dim], DType::F32, &self.device)?;
-
-        for t in 0..seq_len {
-            running_sum = running_sum.broadcast_add(&weighted[t])?;
-            cumsum.push(running_sum.clone());
-        }
-
-        // Compute hidden states: h_t = cumsum[t] * exp(-cumsum_log[t])
-        // Using exp(-cumsum_log[t]) = 1 / prod_{i=0}^{t} lambda_i
-        let mut outputs = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            // h_t = cumsum[t] / exp(cumsum_log[t]) = cumsum[t] * exp(-cumsum_log[t])
-            let neg_cumsum_log = cumsum_log[t].affine(0.0, -1.0)?; // -cumsum_log[t]
-            let inv_cumprod = neg_cumsum_log.exp()?;
-            let h_t = cumsum[t].broadcast_mul(&inv_cumprod)?;
-
-            let q_t = q.narrow(0, t, 1)?.reshape(&[state_dim])?;
-            let b_t = b_gate.narrow(0, t, 1)?;
-
-            let gated = h_t.broadcast_mul(&b_t)?;
-            let y_t = q_t.broadcast_mul(&gated)?;
-            outputs.push(y_t);
-        }
-
-        Tensor::cat(&outputs, 0)
+    pub fn get_conv_weight(&self) -> Tensor {
+        self.conv1d.get_weight()
     }
 
-    /// Serial DeltaNet scan for short sequences
-    fn deltanet_scan_serial(
-        &self,
-        q: &Tensor,
-        kv: &Tensor,
-        b_gate: &Tensor,
-        a_gate: &Tensor,
-        lambda: &Tensor,
-    ) -> Result<Tensor> {
-        let (seq_len, state_dim) = kv.dims2()?;
-
-        let mut state = Tensor::zeros(&[state_dim], DType::F32, &self.device)?;
-        let mut outputs = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            let kv_t = kv.narrow(0, t, 1)?.reshape(&[state_dim])?;
-            let lambda_t = lambda.narrow(0, t, 1)?;
-            let a_t = a_gate.narrow(0, t, 1)?;
-            let q_t = q.narrow(0, t, 1)?.reshape(&[state_dim])?;
-            let b_t = b_gate.narrow(0, t, 1)?;
-
-            // Update state: h_t = lambda_t * h_{t-1} + a_t * kv_t
-            let decayed = state.broadcast_mul(&lambda_t)?;
-            let update = a_t.broadcast_mul(&kv_t)?;
-            state = decayed.broadcast_add(&update)?;
-
-            // Output: y_t = q_t * h_t * b_t
-            let gated = state.broadcast_mul(&b_t)?;
-            let y_t = q_t.broadcast_mul(&gated)?;
-            outputs.push(y_t);
-        }
-
-        Tensor::cat(&outputs, 0)
-    }
-
-    /// Get Q convolution weight (for optimizer)
-    pub fn get_q_conv_weight(&self) -> Tensor {
-        self.q_conv.get_weight()
-    }
-
-    /// Get K convolution weight (for optimizer)
-    pub fn get_k_conv_weight(&self) -> Tensor {
-        self.k_conv.get_weight()
-    }
-
-    /// Get V convolution weight (for optimizer)
-    pub fn get_v_conv_weight(&self) -> Tensor {
-        self.v_conv.get_weight()
-    }
-
-    /// Get output normalization weight (for optimizer)
-    pub fn get_o_norm_weight(&self) -> Tensor {
-        self.o_norm.get_weight()
-    }
-
-    /// Get output normalization gate (for optimizer)
-    pub fn get_o_norm_gate(&self) -> Tensor {
-        self.o_norm.get_gate()
+    pub fn get_norm_weight(&self) -> Tensor {
+        self.norm.get_weight()
     }
 }
 
-/// L2 normalization along the last dimension
-///
-/// Formula: output = x / ||x||_2 * sqrt(d)
-/// where ||x||_2 = sqrt(sum(x^2) + eps)
-///
-/// This is the normalization specified in the Gated DeltaNet paper for Q and K tensors.
-/// The paper's ablation study (Table S.1) shows L2-norm significantly outperforms L1-norm.
-fn l2_normalize(x: &Tensor) -> Result<Tensor> {
-    let (b, l, d) = x.dims3()?;
-    let x_flat = x.reshape(&[b * l, d])?;
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    x.exp()?.affine(1.0, 1.0)?.log()
+}
 
-    // Compute L2 norm: sqrt(sum(x^2) + eps)
+fn apply_mask_to_padding_states(
+    hidden_states: &Tensor,
+    attention_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    if let Some(mask) = attention_mask {
+        let (batch_size, seq_len, _hidden) = hidden_states.dims3()?;
+        let (mask_b, mask_l) = mask.dims2()?;
+        if batch_size > 1 && seq_len > 1 && batch_size == mask_b && seq_len == mask_l {
+            let mask = mask
+                .to_dtype(hidden_states.dtype())?
+                .reshape(&[batch_size, seq_len, 1])?;
+            return hidden_states.broadcast_mul(&mask);
+        }
+    }
+    Ok(hidden_states.clone())
+}
+
+fn l2_normalize_last(x: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let d = *dims
+        .last()
+        .ok_or_else(|| candle_core::Error::Msg("tensor must have rank >= 1".to_string()))?;
+    let n = dims[..dims.len().saturating_sub(1)]
+        .iter()
+        .product::<usize>();
+
+    let x_flat = x.reshape(&[n, d])?;
     let sum_sq = x_flat.sqr()?.sum_keepdim(1)?;
-    let eps_tensor = Tensor::new(1e-6f32, x.device())?;
-    let norm = sum_sq.broadcast_add(&eps_tensor)?.sqrt()?;
-
-    // Normalize: x / ||x||_2
+    let eps = Tensor::new(1e-6f32, x.device())?;
+    let norm = sum_sq.broadcast_add(&eps)?.sqrt()?;
     let normalized = x_flat.broadcast_div(&norm)?;
+    normalized.reshape(dims.as_slice())
+}
 
-    // Scale by sqrt(d) to preserve magnitude
-    let scale = (d as f32).sqrt();
-    let scale_tensor = Tensor::new(scale, x.device())?;
-    let normalized = normalized.broadcast_mul(&scale_tensor)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use candle_core::{DType, Device, D};
 
-    normalized.reshape(&[b, l, d])
+    #[test]
+    fn test_recurrent_fast_matches_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = Config::tiny_5m();
+        cfg.use_fast_kernels = true;
+        let net = GatedDeltaNet::new(&cfg, &device)?;
+
+        let b = 2;
+        let l = 4;
+        let h = net.num_v_heads;
+        let k_dim = net.head_k_dim;
+        let v_dim = net.head_v_dim;
+
+        let q = Tensor::randn(0.0, 1.0, (b, l, h, k_dim), &device)?.to_dtype(DType::F32)?;
+        let k = Tensor::randn(0.0, 1.0, (b, l, h, k_dim), &device)?.to_dtype(DType::F32)?;
+        let v = Tensor::randn(0.0, 1.0, (b, l, h, v_dim), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0.0, 1.0, (b, l, h), &device)?.to_dtype(DType::F32)?;
+        let beta = Tensor::randn(0.0, 1.0, (b, l, h), &device)?.to_dtype(DType::F32)?;
+
+        let (fast_out, fast_state) =
+            net.recurrent_gated_delta_rule_fast(&q, &k, &v, &g, &beta, None)?;
+        let (ref_out, ref_state) =
+            net.recurrent_gated_delta_rule_reference(&q, &k, &v, &g, &beta, None)?;
+
+        let out_diff = fast_out
+            .broadcast_sub(&ref_out)?
+            .abs()?
+            .reshape(&[b * l * h * v_dim])?
+            .max(D::Minus1)?
+            .to_scalar::<f32>()?;
+        let state_diff = fast_state
+            .broadcast_sub(&ref_state)?
+            .abs()?
+            .reshape(&[b * h * k_dim * v_dim])?
+            .max(D::Minus1)?
+            .to_scalar::<f32>()?;
+
+        assert!(out_diff < 1e-4, "fast/reference output diff {}", out_diff);
+        assert!(
+            state_diff < 1e-4,
+            "fast/reference recurrent state diff {}",
+            state_diff
+        );
+        Ok(())
+    }
 }

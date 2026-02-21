@@ -1,5 +1,6 @@
-use candle_core::{Result, Tensor, D, Device, Var};
+use candle_core::{Device, Result, Tensor, Var};
 use candle_nn::Optimizer;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::MiniQwenNext;
@@ -10,13 +11,13 @@ pub struct TrainingConfig {
     pub seq_len: usize,
     pub learning_rate: f64,
     pub weight_decay: f64,
-    pub norm_weight_decay: f64,  // Qwen3-Next: apply weight decay to norm weights
+    pub norm_weight_decay: f64, // Qwen3-Next: apply weight decay to norm weights
     pub warmup_steps: usize,
     pub max_steps: usize,
     pub print_every: usize,
     pub save_every: usize,
     pub checkpoint_dir: String,
-    pub clip_grad_norm: Option<f64>,  // Gradient clipping for stability
+    pub clip_grad_norm: Option<f64>, // Gradient clipping for stability
 }
 
 impl Default for TrainingConfig {
@@ -26,13 +27,13 @@ impl Default for TrainingConfig {
             seq_len: 512,
             learning_rate: 1e-4,
             weight_decay: 0.01,
-            norm_weight_decay: 0.01,  // Per Qwen3-Next: weight decay on norm weights prevents unbounded growth
+            norm_weight_decay: 0.01, // Per Qwen3-Next: weight decay on norm weights prevents unbounded growth
             warmup_steps: 1000,
             max_steps: 50000,
             print_every: 100,
             save_every: 5000,
             checkpoint_dir: "./checkpoints".to_string(),
-            clip_grad_norm: Some(1.0),  // Gradient clipping for stability
+            clip_grad_norm: Some(1.0), // Gradient clipping for stability
         }
     }
 }
@@ -85,10 +86,18 @@ impl AdamW {
         norm_weight_decay: f64,
         other_weight_decay: f64,
     ) -> Result<Self> {
-        // For now, use the average weight decay for all parameters
-        // This is a simplification - a full implementation would handle groups separately
+        // Candle AdamW has a single decay value, so we blend both groups by count.
+        let norm_count = norm_vars.len();
+        let other_count = other_vars.len();
+        let total_count = norm_count + other_count;
+        let blended_weight_decay = if total_count == 0 {
+            other_weight_decay
+        } else {
+            (norm_weight_decay * norm_count as f64 + other_weight_decay * other_count as f64)
+                / total_count as f64
+        };
         let all_vars: Vec<Var> = norm_vars.into_iter().chain(other_vars).collect();
-        Self::new(all_vars, learning_rate, other_weight_decay)
+        Self::new(all_vars, learning_rate, blended_weight_decay)
     }
 
     pub fn step(&mut self, loss: &Tensor) -> Result<()> {
@@ -96,23 +105,16 @@ impl AdamW {
     }
 
     /// Set learning rate for the next steps
-    ///
-    /// Note: This updates the internal learning rate tracker, but does NOT
-    /// modify the underlying optimizer's learning rate. Candle's AdamW
-    /// does not support dynamic learning rate changes after creation.
-    ///
-    /// To use learning rate scheduling, create a new optimizer with the
-    /// desired rate, or implement a custom optimizer wrapper.
     pub fn set_learning_rate(&mut self, lr: f64) {
         self.learning_rate = lr;
+        self.optimizer.set_learning_rate(lr);
     }
 
     /// Get the current learning rate
     ///
-    /// Returns the learning rate being tracked (not necessarily the actual
-    /// optimizer's learning rate if set_learning_rate was called).
+    /// Returns the learning rate currently used by the optimizer.
     pub fn learning_rate(&self) -> f64 {
-        self.learning_rate
+        self.optimizer.learning_rate()
     }
 }
 
@@ -126,11 +128,9 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    pub fn new(
-        model: MiniQwenNext,
-        train_config: TrainingConfig,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn new(model: MiniQwenNext, train_config: TrainingConfig, device: Device) -> Result<Self> {
+        model.set_training(true);
+
         // Extract tensors from model and convert to Var for optimizer
         // Qwen3-Next applies weight decay to norm weights to prevent unbounded growth
         // We use the same weight decay for all parameters for simplicity
@@ -145,6 +145,13 @@ impl Trainer {
         // Qwen3-Next: applies weight decay to all parameters including norms
         let optimizer = AdamW::new(vars, train_config.learning_rate, train_config.weight_decay)?;
 
+        std::fs::create_dir_all(&train_config.checkpoint_dir).map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "Failed to create checkpoint directory {}: {}",
+                train_config.checkpoint_dir, e
+            ))
+        })?;
+
         Ok(Self {
             model,
             optimizer,
@@ -157,6 +164,8 @@ impl Trainer {
     /// Training step
     pub fn step(&mut self, batch: &TrainingBatch) -> Result<TrainingOutput> {
         let start = Instant::now();
+        let lr = self.get_learning_rate();
+        self.optimizer.set_learning_rate(lr);
 
         // Forward pass
         let logits = self.model.forward(&batch.input_ids)?;
@@ -176,13 +185,15 @@ impl Trainer {
             loss: loss_val,
             step: self.step,
             elapsed,
+            learning_rate: lr,
         })
     }
 
     /// Get current learning rate with warmup
     pub fn get_learning_rate(&self) -> f64 {
         if self.step < self.train_config.warmup_steps {
-            self.train_config.learning_rate * (self.step as f64) / (self.train_config.warmup_steps as f64)
+            self.train_config.learning_rate * ((self.step + 1) as f64)
+                / (self.train_config.warmup_steps as f64)
         } else {
             self.train_config.learning_rate
         }
@@ -190,8 +201,111 @@ impl Trainer {
 
     /// Save checkpoint
     pub fn save_checkpoint(&self, path: &str) -> Result<()> {
-        eprintln!("Would save checkpoint to: {}", path);
+        let path = std::path::Path::new(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "Failed to create checkpoint parent directory {:?}: {}",
+                    parent, e
+                ))
+            })?;
+        }
+
+        let tensors = self.model.get_tensors();
+        let mut named_tensors: HashMap<String, Tensor> = HashMap::with_capacity(tensors.len());
+        for (idx, tensor) in tensors.into_iter().enumerate() {
+            named_tensors.insert(format!("param_{idx:05}"), tensor);
+        }
+        candle_core::safetensors::save(&named_tensors, path)?;
+
+        let metadata_path = path.with_extension("json");
+        let metadata = serde_json::json!({
+            "step": self.step,
+            "learning_rate": self.optimizer.learning_rate(),
+            "num_tensors": named_tensors.len(),
+        });
+        let metadata_str = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to serialize metadata: {}", e)))?;
+        std::fs::write(&metadata_path, metadata_str).map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "Failed to write checkpoint metadata {:?}: {}",
+                metadata_path, e
+            ))
+        })?;
+
         Ok(())
+    }
+
+    /// Load model weights from a safetensors checkpoint.
+    ///
+    /// Checkpoint format follows save_checkpoint: param_00000, param_00001, ...
+    /// If sidecar metadata json exists, trainer step is restored from step.
+    pub fn load_checkpoint(&mut self, path: &str) -> Result<()> {
+        let ckpt_path = std::path::Path::new(path);
+        if !ckpt_path.exists() {
+            return Err(candle_core::Error::Msg(format!(
+                "Checkpoint not found: {}",
+                ckpt_path.display()
+            )));
+        }
+
+        let tensors = candle_core::safetensors::load(ckpt_path, &self.device)?;
+        let model_tensors = self.model.get_tensors();
+
+        for (idx, dst) in model_tensors.iter().enumerate() {
+            let name = format!("param_{idx:05}");
+            let src = tensors.get(&name).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "Missing tensor '{}' in checkpoint {}",
+                    name,
+                    ckpt_path.display()
+                ))
+            })?;
+
+            if src.dims() != dst.dims() {
+                return Err(candle_core::Error::Msg(format!(
+                    "Shape mismatch for {}: checkpoint {:?} vs model {:?}",
+                    name,
+                    src.dims(),
+                    dst.dims()
+                )));
+            }
+
+            let src = if src.dtype() != dst.dtype() {
+                src.to_dtype(dst.dtype())?
+            } else {
+                src.clone()
+            };
+
+            let dst_var = Var::from_tensor(dst)?;
+            dst_var.set(&src)?;
+        }
+
+        let metadata_path = ckpt_path.with_extension("json");
+        if metadata_path.exists() {
+            let metadata_raw = std::fs::read_to_string(&metadata_path).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "Failed to read checkpoint metadata {:?}: {}",
+                    metadata_path, e
+                ))
+            })?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_raw).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "Failed to parse checkpoint metadata {:?}: {}",
+                    metadata_path, e
+                ))
+            })?;
+            if let Some(step) = metadata.get("step").and_then(|v| v.as_u64()) {
+                self.step = step as usize;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Current global optimization step.
+    pub fn current_step(&self) -> usize {
+        self.step
     }
 
     /// Reference to model
@@ -223,7 +337,8 @@ impl TrainingBatch {
 
         let input_ids = Tensor::new(data.as_slice(), device)
             .unwrap()
-            .reshape(&[batch_size, seq_len]).unwrap();
+            .reshape(&[batch_size, seq_len])
+            .unwrap();
 
         // Targets are input_ids shifted by 1 (next token prediction)
         let mut target_data = Vec::with_capacity(total);
@@ -233,7 +348,8 @@ impl TrainingBatch {
 
         let targets = Tensor::new(target_data.as_slice(), device)
             .unwrap()
-            .reshape(&[batch_size, seq_len]).unwrap();
+            .reshape(&[batch_size, seq_len])
+            .unwrap();
 
         Self { input_ids, targets }
     }
@@ -244,33 +360,17 @@ pub struct TrainingOutput {
     pub loss: f32,
     pub step: usize,
     pub elapsed: std::time::Duration,
+    pub learning_rate: f64,
 }
 
 /// Cross entropy loss for language modeling
 pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let (b, l, v) = logits.dims3()?;
     let logits_2d = logits.reshape(&[b * l, v])?;
-    let targets_1d = targets.reshape(&[b * l])?;
+    let targets_1d = targets.reshape(&[b * l])?.to_dtype(candle_core::DType::U32)?;
 
-    // Compute cross entropy
-    let log_probs = candle_nn::ops::log_softmax(&logits_2d, D::Minus1)?;
-
-    // Negate: we can use affine operations
-    let zero_point = Tensor::new(&[0.0f32], &log_probs.device())?;
-    let neg_log_probs = zero_point.broadcast_sub(&log_probs)?;
-
-    // Gather log probs for target tokens
-    let targets_u32 = targets_1d.to_dtype(candle_core::DType::U32)?;
-    let gathered = neg_log_probs.index_select(&targets_u32, 1)?;
-
-    let (b, l) = (b as f32, l as f32);
-    let sum = gathered.sum_all()?;
-    // Use affine operation to divide by scalar
-    let inv_count = 1.0 / (b * l);
-    let count_inv = Tensor::new(&[inv_count], &sum.device())?;
-    let count_inv_scalar = count_inv.reshape(&[])?;
-    let loss = sum.mul(&count_inv_scalar)?;
-    Ok(loss)
+    // Use Candle's optimized cross-entropy implementation.
+    candle_nn::loss::cross_entropy(&logits_2d, &targets_1d)
 }
 
 /// Learning rate scheduler (cosine with warmup)
@@ -286,5 +386,96 @@ pub fn cosine_schedule(
     } else {
         let progress = (step - warmup_steps) as f64 / (max_steps - warmup_steps) as f64;
         min_lr + 0.5 * (max_lr - min_lr) * (1.0 + (progress * std::f64::consts::PI).cos())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use candle_core::{DType, Device};
+    use candle_nn::VarBuilder;
+
+    #[test]
+    fn test_training_step_updates_model_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = Config::tiny_5m();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = MiniQwenNext::new(&vb, &device, cfg.clone())?;
+
+        let train_cfg = TrainingConfig {
+            batch_size: 1,
+            seq_len: 4,
+            learning_rate: 1e-3,
+            warmup_steps: 1,
+            max_steps: 1,
+            ..Default::default()
+        };
+        let mut trainer = Trainer::new(model, train_cfg, device.clone())?;
+
+        let before = trainer
+            .model()
+            .get_tensors()
+            .into_iter()
+            .map(|t| t.force_contiguous())
+            .collect::<Result<Vec<_>>>()?;
+        let batch = TrainingBatch::dummy(1, 4, cfg.vocab_size, &device);
+        let logits = trainer.model().forward(&batch.input_ids)?;
+        let loss = cross_entropy_loss(&logits, &batch.targets)?;
+        let grads = loss.backward()?;
+        let grad_count = trainer
+            .model()
+            .get_tensors()
+            .iter()
+            .filter(|t| grads.get(t).is_some())
+            .count();
+        assert!(grad_count > 0, "no gradient found for model tensors");
+
+        trainer.step(&batch)?;
+        let after = trainer.model().get_tensors();
+
+        let mut changed = false;
+        for (before_t, after_t) in before.iter().zip(after.iter()) {
+            let diff = before_t
+                .broadcast_sub(after_t)?
+                .abs()?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+            if diff > 0.0 {
+                changed = true;
+                break;
+            }
+        }
+
+        assert!(changed, "no trainable parameter was updated");
+        Ok(())
+    }
+
+    #[test]
+    fn test_warmup_learning_rate_is_nonzero_on_first_step() {
+        let cfg = TrainingConfig {
+            learning_rate: 1e-4,
+            warmup_steps: 1000,
+            ..Default::default()
+        };
+        let trainer = Trainer {
+            model: panic_model(),
+            optimizer: panic_optimizer(),
+            train_config: cfg,
+            step: 0,
+            device: Device::Cpu,
+        };
+        assert!(trainer.get_learning_rate() > 0.0);
+    }
+
+    fn panic_model() -> MiniQwenNext {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        MiniQwenNext::new(&vb, &device, Config::tiny_5m()).unwrap()
+    }
+
+    fn panic_optimizer() -> AdamW {
+        let vars: Vec<Var> = vec![];
+        AdamW::new(vars, 1e-4, 0.01).unwrap()
     }
 }

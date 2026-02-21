@@ -7,9 +7,10 @@ A minimal Rust implementation of Qwen3-Next architecture with ~10M parameters.
 Sakimi-Next is a compact implementation of the [Qwen3-Next](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd) architecture, featuring:
 
 - **Hybrid 3:1 DeltaNet:Attention layers** - Core innovation from Qwen3-Next
-- **Gated DeltaNet** - Full NVlabs specification with all gates (B, A, Lambda, G)
-- **Gated Attention** - Output gating mechanism to reduce attention sink
-- **Zero-Centered RMSNorm** - Gemma-style normalization for stability
+- **Gated DeltaNet (official-style recurrence)** - `beta/g/A_log/dt_bias` path with short convolution
+- **Fast kernel path (Rust/Candle)** - grouped `conv1d` + vectorized recurrent updates
+- **Gated Attention** - official `q_proj -> (query, gate)` path
+- **Qwen3-Next/Gemma3-style RMSNorm** - `norm(x) * (1 + weight)` for decoder norms
 - **RoPE (25%)** - Rotary Position Embedding on first 25% of dimensions only
 - **SwiGLU FFN** - Modern activation function
 - **GQA** - Grouped Query Attention for efficiency
@@ -63,28 +64,47 @@ cargo run --release -- --config tiny_10m --mode train --steps 10000 --learning-r
 cargo run --release -- --config tiny_10m --mode generate
 ```
 
+## Tencent Cloud GPU
+
+If you want to train on Tencent Cloud GPU CVM, use:
+
+```bash
+bash scripts/train_tencent_gpu.sh
+```
+
+Quickstart details:
+
+- `docs/tencent-cloud-quickstart.md`
+- `scripts/train_nvidia_gpu.sh` (common NVIDIA cloud training entry)
+- `scripts/switch_candle_backend.sh` (switch `cuda` / `metal` / `cpu`)
+
 ## Implementation Details
 
 ### Gated DeltaNet
 
-Implements the full specification from [NVlabs/GatedDeltaNet](https://github.com/NVlabs/GatedDeltaNet):
+Implements the core Qwen3-Next gated-delta path in a small-model setting:
 
-- Q, K, V projections with ShortConvolution (kernel_size=4)
-- Lambda (decay): learnable time-variant decay
-- A (alpha): independent forget gate
-- B (gate): output gating
-- G (gate): output gate projection
-- Numerically stable log-space scan algorithm
-- Head-to-state learnable projection
+- Joint `q/k/v/z` projection + `b/a` projection
+- ShortConvolution on concatenated QKV (kernel_size=4)
+- `g = -exp(A_log) * softplus(a + dt_bias)` discretization path
+- Recurrent gated-delta update used in the official implementation
+- RMSNormGated (`RMSNorm(x) * silu(z)`) before output projection
 
 ### Stability Features
 
 From Qwen3-Next paper:
 
-- **Zero-Centered RMSNorm**: Prevents norm weights from growing unbounded
-- **Weight decay on norms**: Unlike QK-Norm approach, all parameters get weight decay
-- **Output gating**: Eliminates attention sink and massive activation issues
-- **25% RoPE**: Improves extrapolation to longer sequences
+- **Qwen3-Next/Gemma3-style RMSNorm** for decoder norms
+- **Q/K RMSNorm + gated attention output path**
+- **25% RoPE** for attention heads
+
+### Scope
+
+This repository targets compact models and does not yet include:
+
+- MoE routing/expert layers from the full Qwen3-Next release
+- External CUDA kernel stack (`flash-linear-attention`, `causal-conv1d`) from the official ecosystem
+- Full MTP training/inference pipeline
 
 ## References
 

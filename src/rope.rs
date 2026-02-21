@@ -19,7 +19,6 @@ struct RopeCache {
 #[derive(Clone)]
 pub struct RoPE {
     dim: usize,
-    rope_ratio: f64,  // Fraction of head_dim to apply RoPE (0.25 = 25%)
     max_seq_len: usize,
     base: f64,
     // Use RwLock for better read performance: multiple readers can access cache simultaneously
@@ -27,16 +26,15 @@ pub struct RoPE {
 }
 
 impl RoPE {
-    pub fn new(head_dim: usize, max_seq_len: usize, rope_ratio: f64) -> Self {
+    pub fn new(head_dim: usize, max_seq_len: usize, rope_ratio: f64, rope_theta: f64) -> Self {
         // Ensure at least 2 dimensions for RoPE (need at least 1 pair)
         let dim = ((head_dim as f64 * rope_ratio) as usize).max(2);
         // Also ensure dim is even
         let dim = if dim % 2 == 0 { dim } else { dim - 1 };
         Self {
             dim,
-            rope_ratio,
             max_seq_len,
-            base: 10000.0,
+            base: rope_theta,
             cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -45,9 +43,7 @@ impl RoPE {
     fn build_cache(&self, seq_len: usize, device: &candle_core::Device) -> Result<RopeCache> {
         // Create inv_freq: theta_i = base^(-2i/dim) for i in [0, dim/2)
         let inv_freq: Vec<f64> = (0..(self.dim / 2))
-            .map(|i| {
-                1.0 / (self.base.powf((2 * i) as f64 / self.dim as f64))
-            })
+            .map(|i| 1.0 / (self.base.powf((2 * i) as f64 / self.dim as f64)))
             .collect();
 
         // Compute freqs: positions * inv_freq
@@ -67,10 +63,8 @@ impl RoPE {
         }
 
         // Create sin/cos tensors: (seq_len, dim/2)
-        let sin = Tensor::new(sin_vals.as_slice(), device)?
-            .reshape(&[seq_len, self.dim / 2])?;
-        let cos = Tensor::new(cos_vals.as_slice(), device)?
-            .reshape(&[seq_len, self.dim / 2])?;
+        let sin = Tensor::new(sin_vals.as_slice(), device)?.reshape(&[seq_len, self.dim / 2])?;
+        let cos = Tensor::new(cos_vals.as_slice(), device)?.reshape(&[seq_len, self.dim / 2])?;
 
         Ok(RopeCache { sin, cos, seq_len })
     }
@@ -92,8 +86,9 @@ impl RoPE {
                     drop(read_guard);
 
                     // Re-acquire for the actual operation
-                    let read_guard = self.cache.read()
-                        .map_err(|e| candle_core::Error::Msg(format!("RoPE cache lock poisoned: {}", e)))?;
+                    let read_guard = self.cache.read().map_err(|e| {
+                        candle_core::Error::Msg(format!("RoPE cache lock poisoned: {}", e))
+                    })?;
                     if let Some(ref cache) = *read_guard {
                         if cache.seq_len == seq_len {
                             return Ok(RopeCache {
@@ -111,7 +106,9 @@ impl RoPE {
         }
 
         // Slow path: need to build or extend cache
-        let mut write_guard = self.cache.write()
+        let mut write_guard = self
+            .cache
+            .write()
             .map_err(|e| candle_core::Error::Msg(format!("RoPE cache lock poisoned: {}", e)))?;
 
         // Check again in case another thread already built it
@@ -175,9 +172,13 @@ impl RoPE {
         };
 
         // sin, cos have shape (l, dim/2), need to expand to (b, l, 1, dim/2)
-        let sin = sin.reshape(&[l, self.dim / 2])?.reshape(&[1, l, 1, self.dim / 2])?
+        let sin = sin
+            .reshape(&[l, self.dim / 2])?
+            .reshape(&[1, l, 1, self.dim / 2])?
             .broadcast_as(&[b, l, 1, self.dim / 2])?;
-        let cos = cos.reshape(&[l, self.dim / 2])?.reshape(&[1, l, 1, self.dim / 2])?
+        let cos = cos
+            .reshape(&[l, self.dim / 2])?
+            .reshape(&[1, l, 1, self.dim / 2])?
             .broadcast_as(&[b, l, 1, self.dim / 2])?;
 
         // Apply rotary embedding to Q
@@ -207,8 +208,8 @@ impl RoPE {
         let half_dim = rot_dim / 2;
 
         // Split into left and right halves
-        let x_left = x.narrow(3, 0, half_dim)?;  // (B, L, H, half_dim)
-        let x_right = x.narrow(3, half_dim, half_dim)?;  // (B, L, H, half_dim)
+        let x_left = x.narrow(3, 0, half_dim)?; // (B, L, H, half_dim)
+        let x_right = x.narrow(3, half_dim, half_dim)?; // (B, L, H, half_dim)
         let x_rest = if rot_dim < head_dim {
             Some(x.narrow(3, rot_dim, head_dim - rot_dim)?)
         } else {
@@ -221,11 +222,13 @@ impl RoPE {
 
         // Apply rotation
         // left_rot = left * cos - right * sin
-        let left_rot = x_left.broadcast_mul(&cos)?
+        let left_rot = x_left
+            .broadcast_mul(&cos)?
             .broadcast_sub(&x_right.broadcast_mul(&sin)?)?;
 
         // right_rot = left * sin + right * cos
-        let right_rot = x_left.broadcast_mul(&sin)?
+        let right_rot = x_left
+            .broadcast_mul(&sin)?
             .broadcast_add(&x_right.broadcast_mul(&cos)?)?;
 
         // Concatenate: [left_rot, right_rot, rest]

@@ -14,8 +14,7 @@
 /// [3] DeepSeek-V3 Technical Report
 /// [9] Better & faster large language models via multi-token prediction
 /// [10] ProphetNet: Predicting Future N-gram for Sequence-to-Sequence Pre-training
-
-use candle_core::{Result, Tensor, Device};
+use candle_core::{Device, Result, Tensor};
 
 use crate::Config;
 
@@ -36,7 +35,7 @@ impl Default for MTPConfig {
     fn default() -> Self {
         Self {
             n_predict: 3,
-            enabled: false,  // Disabled by default - requires specific training
+            enabled: false, // Disabled by default - requires specific training
             acceptance_threshold: 0.8,
         }
     }
@@ -93,7 +92,7 @@ impl MultiTokenPrediction {
         // the token at position t+1, t+2, ..., t+n_predict
 
         Err(candle_core::Error::Msg(
-            "Multi-Token Prediction not yet implemented. Enable MTP training first.".to_string()
+            "Multi-Token Prediction not yet implemented. Enable MTP training first.".to_string(),
         ))
     }
 
@@ -115,7 +114,7 @@ impl MultiTokenPrediction {
         // Loss = L_next + sum_{i=1}^{n_predict} lambda_i * L_{t+i} + L_consistency
 
         Err(candle_core::Error::Msg(
-            "Multi-Token Prediction loss not yet implemented.".to_string()
+            "Multi-Token Prediction loss not yet implemented.".to_string(),
         ))
     }
 
@@ -170,10 +169,7 @@ impl MTPTraining {
     ///   ]
     ///
     /// PLACEHOLDER: Returns empty vec
-    pub fn prepare_ngram_targets(
-        _tokens: &Tensor,
-        _n_predict: usize,
-    ) -> Result<Vec<Tensor>> {
+    pub fn prepare_ngram_targets(_tokens: &Tensor, _n_predict: usize) -> Result<Vec<Tensor>> {
         // TODO: Implement n-gram target preparation
         Ok(vec![])
     }
@@ -184,9 +180,7 @@ impl MTPTraining {
     /// the recursive application of t+1 predictions.
     ///
     /// PLACEHOLDER: Returns zero loss
-    pub fn consistency_loss(
-        _predictions: &[Tensor],
-    ) -> Result<Tensor> {
+    pub fn consistency_loss(_predictions: &[Tensor]) -> Result<Tensor> {
         // TODO: Implement consistency loss
         // This ensures that:
         // pred(t+2) ≈ model(pred(t+1))
@@ -194,7 +188,7 @@ impl MTPTraining {
         // etc.
 
         Err(candle_core::Error::Msg(
-            "Consistency loss not yet implemented.".to_string()
+            "Consistency loss not yet implemented.".to_string(),
         ))
     }
 }

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 /// Simple character-level tokenizer with common word optimization
 ///
@@ -69,12 +69,8 @@ impl SimpleTokenizer {
     /// 1. Counts character frequencies
     /// 2. Takes the most common chars up to vocab_size
     /// 3. Returns the vocabulary
-    pub fn build_vocab_from_file(
-        path: &Path,
-        vocab_size: usize,
-    ) -> Result<Vec<String>, String> {
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open file: {}", e))?;
+    pub fn build_vocab_from_file(path: &Path, vocab_size: usize) -> Result<Vec<String>, String> {
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let reader = BufReader::new(file);
 
         let mut char_freq: HashMap<char, usize> = HashMap::new();
@@ -101,24 +97,27 @@ impl SimpleTokenizer {
 
         // Build vocabulary
         let mut vocab = Vec::with_capacity(vocab_size);
+        let mut seen = HashSet::with_capacity(vocab_size);
 
         // Add common words/subwords (for Chinese)
         // These are frequently used bigrams/trigrams
         let common_chinese_subwords = vec![
             // Common particles
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
-            "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
-            "你", "会", "着", "没有", "看", "好", "自己", "这",
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上",
+            "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这",
             // Numbers and digits
-            "零", "一", "二", "三", "四", "五", "六", "七", "八", "九",
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-            // Common punctuation
+            "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "0", "1", "2", "3", "4",
+            "5", "6", "7", "8", "9", // Common punctuation
             "。", "，", "、", "：", "；", "！", "？", "（", "）", "「", "」",
         ];
 
         for word in common_chinese_subwords {
-            if vocab.len() < num_regular_tokens {
-                vocab.push(word.to_string());
+            if vocab.len() >= num_regular_tokens {
+                break;
+            }
+            let token = word.to_string();
+            if seen.insert(token.clone()) {
+                vocab.push(token);
             }
         }
 
@@ -127,16 +126,25 @@ impl SimpleTokenizer {
             if vocab.len() >= num_regular_tokens {
                 break;
             }
-            vocab.push(ch.to_string());
+            let token = ch.to_string();
+            if seen.insert(token.clone()) {
+                vocab.push(token);
+            }
         }
 
-        // Fill remaining with bytes (for full coverage)
+        // Fill remaining slots to match requested vocabulary size.
+        // Keep the first 256 extras as byte tokens for compatibility, then
+        // continue with generic placeholders.
+        let mut filler_id = 0usize;
         while vocab.len() < num_regular_tokens {
-            let byte_id = vocab.len() - num_regular_tokens;
-            if byte_id < 256 {
-                vocab.push(format!("<byte_{}>", byte_id));
+            let token = if filler_id < 256 {
+                format!("<byte_{}>", filler_id)
             } else {
-                break;
+                format!("<extra_{}>", filler_id - 256)
+            };
+            filler_id += 1;
+            if seen.insert(token.clone()) {
+                vocab.push(token);
             }
         }
 
@@ -152,8 +160,7 @@ impl SimpleTokenizer {
 
         // Process all files
         for path in paths {
-            let file = File::open(path)
-                .map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+            let file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
             let reader = BufReader::new(file);
 
             for line in reader.lines() {
@@ -174,19 +181,23 @@ impl SimpleTokenizer {
         // Build vocabulary (same logic as single file)
         let num_regular_tokens = vocab_size.saturating_sub(4);
         let mut vocab = Vec::with_capacity(vocab_size);
+        let mut seen = HashSet::with_capacity(vocab_size);
 
         let common_chinese_subwords = vec![
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
-            "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
-            "你", "会", "着", "没有", "看", "好", "自己", "这",
-            "零", "一", "二", "三", "四", "五", "六", "七", "八", "九",
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-            "。", "，", "、", "：", "；", "！", "？", "（", "）", "「", "」",
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上",
+            "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这",
+            "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "0", "1", "2", "3", "4",
+            "5", "6", "7", "8", "9", "。", "，", "、", "：", "；", "！", "？", "（", "）", "「",
+            "」",
         ];
 
         for word in common_chinese_subwords {
-            if vocab.len() < num_regular_tokens {
-                vocab.push(word.to_string());
+            if vocab.len() >= num_regular_tokens {
+                break;
+            }
+            let token = word.to_string();
+            if seen.insert(token.clone()) {
+                vocab.push(token);
             }
         }
 
@@ -194,15 +205,22 @@ impl SimpleTokenizer {
             if vocab.len() >= num_regular_tokens {
                 break;
             }
-            vocab.push(ch.to_string());
+            let token = ch.to_string();
+            if seen.insert(token.clone()) {
+                vocab.push(token);
+            }
         }
 
+        let mut filler_id = 0usize;
         while vocab.len() < num_regular_tokens {
-            let byte_id = vocab.len() - num_regular_tokens;
-            if byte_id < 256 {
-                vocab.push(format!("<byte_{}>", byte_id));
+            let token = if filler_id < 256 {
+                format!("<byte_{}>", filler_id)
             } else {
-                break;
+                format!("<extra_{}>", filler_id - 256)
+            };
+            filler_id += 1;
+            if seen.insert(token.clone()) {
+                vocab.push(token);
             }
         }
 
@@ -270,7 +288,11 @@ impl SimpleTokenizer {
             // If no multi-char match, fall back to single character
             if !matched {
                 let ch_str = ch.to_string();
-                let token_id = self.token_to_id.get(&ch_str).copied().unwrap_or(self.unk_token);
+                let token_id = self
+                    .token_to_id
+                    .get(&ch_str)
+                    .copied()
+                    .unwrap_or(self.unk_token);
                 tokens.push(token_id);
                 i += 1;
             }
@@ -289,14 +311,17 @@ impl SimpleTokenizer {
 
         for &token_id in tokens {
             // Skip special tokens except UNK
-            if token_id == self.pad_token || token_id == self.bos_token || token_id == self.eos_token {
+            if token_id == self.pad_token
+                || token_id == self.bos_token
+                || token_id == self.eos_token
+            {
                 continue;
             }
 
             if let Some(token) = self.id_to_token.get(token_id as usize) {
                 // Remove special angle bracket notation for bytes
                 let token_str = if token.starts_with("<byte_") && token.ends_with('>') {
-                    let byte_str = &token[6..token.len()-1];
+                    let byte_str = &token[6..token.len() - 1];
                     if let Ok(byte_val) = byte_str.parse::<u8>() {
                         (byte_val as char).to_string()
                     } else {
@@ -320,18 +345,25 @@ impl SimpleTokenizer {
     }
 
     /// Get special token IDs
-    pub fn pad_id(&self) -> u32 { self.pad_token }
-    pub fn unk_id(&self) -> u32 { self.unk_token }
-    pub fn bos_id(&self) -> u32 { self.bos_token }
-    pub fn eos_id(&self) -> u32 { self.eos_token }
+    pub fn pad_id(&self) -> u32 {
+        self.pad_token
+    }
+    pub fn unk_id(&self) -> u32 {
+        self.unk_token
+    }
+    pub fn bos_id(&self) -> u32 {
+        self.bos_token
+    }
+    pub fn eos_id(&self) -> u32 {
+        self.eos_token
+    }
 
     /// Save tokenizer to file
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize tokenizer: {}", e))?;
 
-        let mut file = File::create(path)
-            .map_err(|e| format!("Failed to create file: {}", e))?;
+        let mut file = File::create(path).map_err(|e| format!("Failed to create file: {}", e))?;
 
         file.write_all(json.as_bytes())
             .map_err(|e| format!("Failed to write: {}", e))?;
@@ -341,12 +373,11 @@ impl SimpleTokenizer {
 
     /// Load tokenizer from file
     pub fn load(path: &Path) -> Result<Self, String> {
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open file: {}", e))?;
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
 
         let reader = BufReader::new(file);
-        let tokenizer: Self = serde_json::from_reader(reader)
-            .map_err(|e| format!("Failed to deserialize: {}", e))?;
+        let tokenizer: Self =
+            serde_json::from_reader(reader).map_err(|e| format!("Failed to deserialize: {}", e))?;
 
         Ok(tokenizer)
     }
